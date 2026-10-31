@@ -73,6 +73,10 @@ from models.common import (
     SDTAEncoder,
     EdgeNeXt_Block,
     EdgeNeXt_Stem,
+    CrossModalOffsetGenerator,
+    UDAO_ASFF,
+    SobelLaplacianFilter,
+    D_FATM,
 )
 from models.experimental import MixConv2d
 from models.unireplknet import *
@@ -586,6 +590,10 @@ def parse_model(d, ch):
             args = [c2,args[1]]
             # args = [c2]
 
+        elif m is UDAO_ASFF:
+            c2 = ch[f[0]]
+            args = [c2, args[1]] if len(args) > 1 else [c2]
+
         elif m is EVCBlock:
             c2 = args[0]  #   l 256    s 128   
             args = [c2,args[1]]
@@ -593,6 +601,10 @@ def parse_model(d, ch):
         elif m is LCBHAM:
             c2 = ch[f]  #   l 256    s 128   
             # args = [c2,args[1]]
+            args = [c2]
+
+        elif m is D_FATM:
+            c2 = ch[f]
             args = [c2]
         
         # elif m is deformableLKABlock:

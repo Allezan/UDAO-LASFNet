@@ -1,0 +1,38 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Datasets & Training Outputs / Checkpoints
+dataset/
+datasets/
+runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.mlmodel
+*.tflite
+*.pb
+*.cache
+
+# Logs & Profiling
+wandb/
+comet_ml/
+events.out.tfevents.*
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

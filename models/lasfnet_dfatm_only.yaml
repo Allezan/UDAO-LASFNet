@@ -1,0 +1,57 @@
+# Ablation Study Config 2: LASFNet + D_FATM Only (Layer 10 = MFS, Layer 24 = D_FATM + BAB)
+nc: 80  # number of classes
+depth_multiple: 0.33  # model depth multiple
+width_multiple: 0.50  # layer channel multiple
+anchors:
+  - [10,13, 16,30, 33,23]  # P3/8
+  - [30,61, 62,45, 59,119]  # P4/16
+  - [116,90, 156,198, 373,326]  # P5/32
+
+backbone:
+  [
+   [-1, 1, Conv, [64, 6, 2, 2]],   # 0-P1/2 (RGB)
+   [-1, 1, Conv, [128, 3, 2]],     # 1-P2/4 (RGB)
+   [-1, 3, C3, [128]],             # 2-P2/4
+   [-1, 1, Conv, [256, 3, 2]],     # 3-P3/8
+   [-1, 6, C3, [256]],             # 4-P3/8
+
+   [-4, 1, Conv, [64, 6, 2, 2]],   # 5-P1/2 (IR)
+   [-1, 1, Conv, [128, 3, 2]],     # 6-P2/4 (IR)
+   [-1, 3, C3, [128]],             # 7-P2/4
+   [-1, 1, Conv, [256, 3, 2]],     # 8-P3/8
+   [-1, 6, C3, [256]],             # 9-P3/8
+
+   [[4, 9], 1, MFS, [256, 4]],     # 10-P3/8 (Baseline MFS/ASFF)
+
+   [-1, 1, Conv, [512, 3, 2]],     # 11-P4/16
+   [-1, 9, C3, [512]],             # 12
+   [-1, 1, Conv, [1024, 3, 2]],    # 13-P5/32
+   [-1, 3, C3, [1024]],            # 14
+   [-1, 1, SPPF, [1024, 5]],       # 15
+  ]
+
+head: [
+    [-1, 1, Conv, [512, 1, 1]],
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+    [[-1, 12], 1, Concat, [1]],
+    [-1, 3, C3, [512, False]],
+
+    [-1, 1, Conv, [256, 1, 1]],
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+    [[-1, 10], 1, Concat, [1]],
+    [-1, 3, C3, [256, False]],
+
+    [-1, 1, D_FATM, [128]],        # 24 (D-FATM Only + Auxiliary Boundary Loss)
+    [-1, 3, C3, [256, False]],
+
+    [-1, 1, Conv, [256, 3, 2]],
+    [[-1, 20], 1, Concat, [1]],
+    [-1, 3, C3, [512, False]],
+
+    [-1, 1, Conv, [512, 3, 2]],
+    [[-1, 16], 1, Concat, [1]],
+    [-1, 3, C3, [1024, False]],
+
+    [[25, 28, 31], 1, Detect, [nc, anchors]],
+  ]
+

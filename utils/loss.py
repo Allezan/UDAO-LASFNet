@@ -3,6 +3,8 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from models.common import D_FATM, SobelLaplacianFilter
 from utils.torch_utils import is_parallel
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
@@ -169,6 +171,80 @@ def wasserstein_loss(pred, target, eps=1e-7, constant=12.8):
     return torch.exp(-torch.sqrt(wasserstein_2) / constant)
 
 
+class AuxiliaryBoundaryLoss(nn.Module):
+    """
+    Boundary-Aware Auxiliary Loss (BAB) with Ground-Truth Bounding Box Masking (M_gt).
+    Supervises D_FATM's differential edge branch during training using on-the-fly
+    Sobel+Laplacian edge targets masked to foreground object regions, incurring
+    zero inference cost.
+    """
+
+    def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0, eps: float = 1e-6):
+        super().__init__()
+        self.edge_extractor = SobelLaplacianFilter(normalize=True, eps=eps)
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.eps = eps
+
+    @torch.no_grad()
+    def _build_masked_edge_target(
+        self,
+        edge_shape: tuple,
+        targets: torch.Tensor,
+        imgs_rgb: torch.Tensor,
+        imgs_ir: torch.Tensor = None,
+    ) -> torch.Tensor:
+        bs, _, h_e, w_e = edge_shape
+        device = imgs_rgb.device
+
+        # 1. Downsample RGB (and optional IR) to P3/8 resolution (80x80) and extract normalized edges
+        rgb_low = F.interpolate(imgs_rgb.float(), size=(h_e, w_e), mode="bilinear", align_corners=False)
+        edge_raw = self.edge_extractor(rgb_low)
+
+        if imgs_ir is not None:
+            ir_low = F.interpolate(imgs_ir.float(), size=(h_e, w_e), mode="bilinear", align_corners=False)
+            edge_ir = self.edge_extractor(ir_low)
+            edge_raw = torch.maximum(edge_raw, edge_ir)
+
+        # 2. Construct Ground-Truth Bounding Box Mask M_gt (suppressing background clutter)
+        mask_gt = torch.zeros((bs, 1, h_e, w_e), dtype=edge_raw.dtype, device=device)
+        if targets is not None and targets.numel() > 0:
+            for t in targets:
+                b_idx = int(t[0].item())
+                if 0 <= b_idx < bs:
+                    xc, yc, bw, bh = t[2].item(), t[3].item(), t[4].item(), t[5].item()
+                    # Include a 1-cell boundary margin so outer vehicle contours are fully captured
+                    x1 = max(0, int((xc - 0.5 * bw) * w_e) - 1)
+                    y1 = max(0, int((yc - 0.5 * bh) * h_e) - 1)
+                    x2 = min(w_e, int((xc + 0.5 * bw) * w_e + 0.999) + 1)
+                    y2 = min(h_e, int((yc + 0.5 * bh) * h_e + 0.999) + 1)
+                    if x2 > x1 and y2 > y1:
+                        mask_gt[b_idx, 0, y1:y2, x1:x2] = 1.0
+
+        return (edge_raw * mask_gt).clamp(0.0, 1.0)
+
+    def forward(
+        self,
+        edge_logits: torch.Tensor,
+        targets: torch.Tensor,
+        imgs_rgb: torch.Tensor,
+        imgs_ir: torch.Tensor = None,
+    ) -> torch.Tensor:
+        edge_gt = self._build_masked_edge_target(edge_logits.shape, targets, imgs_rgb, imgs_ir)
+        edge_gt = edge_gt.to(dtype=edge_logits.dtype)
+
+        # AMP-safe Binary Cross-Entropy with Logits
+        bce_loss = F.binary_cross_entropy_with_logits(edge_logits, edge_gt, reduction="mean")
+
+        # Foreground Soft Dice Loss
+        pred_prob = torch.sigmoid(edge_logits)
+        intersection = (pred_prob * edge_gt).sum(dim=(1, 2, 3))
+        denom = (pred_prob * pred_prob).sum(dim=(1, 2, 3)) + (edge_gt * edge_gt).sum(dim=(1, 2, 3))
+        dice_loss = (1.0 - (2.0 * intersection + self.eps) / (denom + self.eps)).mean()
+
+        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+
+
 class ComputeLoss:
     sort_obj_iou = False
 
@@ -190,7 +266,8 @@ class ComputeLoss:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        m = de_parallel(model).model[-1]  # Detect() module
+        det_model = de_parallel(model)
+        m = det_model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(m.nl, [4.0, 1.0, 0.25, 0.06, 0.02])  # P3-P7
         self.ssi = list(m.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, 1.0, h, autobalance
@@ -200,11 +277,18 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-    def __call__(self, p, targets):  # predictions, targets
-        """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
+        # Auxiliary Boundary Supervision (BAB) for D_FATM modules (if present in model)
+        self.dfatm_modules = [mod for mod in det_model.model.modules() if isinstance(mod, D_FATM)]
+        self.aux_boundary_loss = AuxiliaryBoundaryLoss().to(device) if self.dfatm_modules else None
+        self.lambda_edge = float(h.get("edge", 0.1))
+        self.last_edge_loss = torch.zeros(1, device=device)
+
+    def __call__(self, p, targets, imgs=None, imgs_ir=None):  # predictions, targets, optional RGB/IR images
+        """Performs forward pass, calculating class, box, object, and optional auxiliary boundary loss."""
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
+        ledge = torch.zeros(1, device=self.device)  # auxiliary boundary loss (BAB)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
@@ -266,9 +350,18 @@ class ComputeLoss:
         lbox *= self.hyp["box"]
         lobj *= self.hyp["obj"]
         lcls *= self.hyp["cls"]
+
+        # Auxiliary Boundary Loss (active only during training when D_FATM and input images are provided)
+        if self.aux_boundary_loss is not None and imgs is not None:
+            for mod in self.dfatm_modules:
+                if mod.edge_logits is not None:
+                    ledge += self.aux_boundary_loss(mod.edge_logits, targets, imgs, imgs_ir)
+            ledge *= self.lambda_edge
+        self.last_edge_loss = ledge.detach()
+
         bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        return (lbox + lobj + lcls + ledge) * bs, torch.cat((lbox, lobj, lcls)).detach()
         #return (lbox + lobj + lcls) * bs, lbox , lobj , lcls
 
         # return (lbox + lobj) * bs, torch.cat((lbox, lobj, lcls)).detach()

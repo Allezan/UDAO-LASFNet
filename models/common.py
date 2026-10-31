@@ -888,7 +888,7 @@ class DetectMultiBackend(nn.Module):
         elif xml:  # OpenVINO
             LOGGER.info(f"Loading {w} for OpenVINO inference...")
             check_requirements("openvino>=2023.0")  # requires openvino-dev: https://pypi.org/project/openvino-dev/
-            from openvino.runtime import Core, Layout, get_batch
+            from openvino.runtime import Core, Layout, get_batch  # type: ignore
 
             core = Core()
             if not Path(w).is_file():  # if not *.xml
@@ -903,7 +903,7 @@ class DetectMultiBackend(nn.Module):
             stride, names = self._load_metadata(Path(w).with_suffix(".yaml"))  # load metadata
         elif engine:  # TensorRT
             LOGGER.info(f"Loading {w} for TensorRT inference...")
-            import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
+            import tensorrt as trt  # type: ignore  # https://developer.nvidia.com/nvidia-tensorrt-download
 
             check_version(trt.__version__, "7.0.0", hard=True)  # require tensorrt>=7.0.0
             if device.type == "cpu":
@@ -951,18 +951,18 @@ class DetectMultiBackend(nn.Module):
             batch_size = bindings["images"].shape[0]  # if dynamic, this is instead max batch size
         elif coreml:  # CoreML
             LOGGER.info(f"Loading {w} for CoreML inference...")
-            import coremltools as ct
+            import coremltools as ct  # type: ignore
 
             model = ct.models.MLModel(w)
         elif saved_model:  # TF SavedModel
             LOGGER.info(f"Loading {w} for TensorFlow SavedModel inference...")
-            import tensorflow as tf
+            import tensorflow as tf  # type: ignore
 
             keras = False  # assume TF1 saved_model
             model = tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
         elif pb:  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
             LOGGER.info(f"Loading {w} for TensorFlow GraphDef inference...")
-            import tensorflow as tf
+            import tensorflow as tf  # type: ignore
 
             def wrap_frozen_graph(gd, inputs, outputs):
                 """Wraps a TensorFlow GraphDef for inference, returning a pruned function."""
@@ -984,9 +984,9 @@ class DetectMultiBackend(nn.Module):
             frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
         elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
             try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
-                from tflite_runtime.interpreter import Interpreter, load_delegate
+                from tflite_runtime.interpreter import Interpreter, load_delegate  # type: ignore
             except ImportError:
-                import tensorflow as tf
+                import tensorflow as tf  # type: ignore
 
                 Interpreter, load_delegate = (
                     tf.lite.Interpreter,
@@ -1015,7 +1015,7 @@ class DetectMultiBackend(nn.Module):
         elif paddle:  # PaddlePaddle
             LOGGER.info(f"Loading {w} for PaddlePaddle inference...")
             check_requirements("paddlepaddle-gpu" if cuda else "paddlepaddle")
-            import paddle.inference as pdi
+            import paddle.inference as pdi  # type: ignore
 
             if not Path(w).is_file():  # if not *.pdmodel
                 w = next(Path(w).rglob("*.pdmodel"))  # get *.pdmodel file from *_paddle_model dir
@@ -3667,3 +3667,220 @@ class EdgeNeXt_Stem(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+
+# ==============================================================================
+# UDAO-LASFNet Modules (Step 1 & Step 2)
+# 1. CrossModalOffsetGenerator & UDAO_ASFF (Uncertainty-Driven Deformable Alignment)
+# 2. SobelLaplacianFilter & D_FATM (Differential Feature Attention Transformation)
+# ==============================================================================
+from torchvision.ops import deform_conv2d
+
+
+class CrossModalOffsetGenerator(nn.Module):
+    """
+    Lightweight Cross-Modal Deformable Offset & Modulation Mask Generator.
+    Predicts 2D spatial offsets (2 * K * K) and modulation scalars (K * K)
+    by jointly analyzing channel-attended IR and RGB features.
+    """
+
+    def __init__(self, channels: int = 128, kernel_size: int = 3, init_scale: float = 2.0):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        in_ch = channels * 2
+        out_ch = 3 * kernel_size * kernel_size  # 18 offset channels + 9 mask channels for K=3
+
+        # Depthwise-separable cross-modal offset predictor
+        self.dw_conv = nn.Conv2d(
+            in_ch, in_ch, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=in_ch, bias=False
+        )
+        self.bn = nn.BatchNorm2d(in_ch)
+        self.act = nn.SiLU(inplace=True)
+        self.pw_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+
+        # Learnable offset range scaler gamma (initialized to 2.0 -> +/-16px at stride 8)
+        self.offset_scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+        # Zero-initialize projection so initial training starts from identity grid (zero offset)
+        nn.init.constant_(self.pw_conv.weight, 0.0)
+        nn.init.constant_(self.pw_conv.bias, 0.0)
+
+    def forward(self, x_ir: torch.Tensor, x_rgb: torch.Tensor):
+        x_cross = torch.cat([x_ir, x_rgb], dim=1)  # (B, 2C, H, W)
+        feat = self.act(self.bn(self.dw_conv(x_cross)))
+        out = self.pw_conv(feat)  # (B, 27, H, W)
+
+        o1, o2, mask_logits = torch.chunk(out, 3, dim=1)
+        raw_offset = torch.cat([o1, o2], dim=1)  # (B, 18, H, W)
+
+        scale = self.offset_scale.to(dtype=raw_offset.dtype)
+        offset = scale * torch.tanh(raw_offset)  # bounded in [-gamma, +gamma]
+        mask = torch.sigmoid(mask_logits)  # bounded in (0, 1), shape (B, 9, H, W)
+        return offset, mask
+
+
+class UDAO_ASFF(nn.Module):
+    """
+    Uncertainty-Driven Deformable Alignment & Attention-Guided Self-Modulation
+    Feature Fusion (UDAO-ASFF). Replaces static MFS at Layer 10 (P3/8).
+    """
+
+    def __init__(self, channels: int = 128, index: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.index = index
+
+        # Stage 1a: Channel Attention (ECA 1D Conv)
+        self.channel_att = channel_att(channels)
+
+        # Stage 1b: RGB spatial branch (3x3 DWConv) & Cross-Modal Deformable IR branch
+        self.rgb_dwconv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=channels)
+        self.offset_gen = CrossModalOffsetGenerator(channels, kernel_size=3, init_scale=2.0)
+        self.ir_dcn_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=channels)
+
+        # Stage 1c: Position Attention Module (1D H/W Coordinate Attention)
+        self.local_att = local_att(channels)
+
+        # Stage 2: Feature Modulation Block (SMFA/DFM + PCFN/FM)
+        self.fmb = FMB(channels, 2)
+
+        # Stage 3: Channel Shuffle
+        self.channel_shuffle = Channel_Shuffle(8)
+
+    def forward(self, x):
+        # x[0]: P3_RGB (Layer 4), x[1]: P3_IR (Layer 9)
+        input_rgb, input_ir = x[0], x[1]
+
+        # 1. ECA Channel Attention + Residual
+        rgb_ca = self.channel_att(input_rgb) + input_rgb
+        ir_ca = self.channel_att(input_ir) + input_ir
+
+        # 2. RGB reference spatial refinement
+        rgb_feat = self.rgb_dwconv(rgb_ca)
+
+        # 3. Cross-Modal Deformable Alignment of IR onto RGB reference frame
+        offset, mask = self.offset_gen(ir_ca, rgb_feat)
+        ir_aligned = deform_conv2d(
+            input=ir_ca,
+            offset=offset.to(dtype=ir_ca.dtype),
+            weight=self.ir_dcn_conv.weight.to(dtype=ir_ca.dtype),
+            bias=self.ir_dcn_conv.bias.to(dtype=ir_ca.dtype) if self.ir_dcn_conv.bias is not None else None,
+            stride=(1, 1),
+            padding=(1, 1),
+            dilation=(1, 1),
+            mask=mask.to(dtype=ir_ca.dtype),
+        )
+
+        # 4. Aligned Multimodal Addition + Position Attention (PAM)
+        xc = rgb_feat + ir_aligned
+        x_loc = self.local_att(xc)
+
+        # 5. Self-Modulation Feature Block (FMB) + Channel Shuffle
+        x_mod = self.fmb(x_loc)
+        out = self.channel_shuffle(x_mod)
+        return out
+
+
+class SobelLaplacianFilter(nn.Module):
+    """
+    Fixed, non-trainable high-pass Sobel + 8-neighbor Laplacian edge filter.
+    Registered as persistent buffers so tensors automatically move across CPU/CUDA/AMP
+    with zero trainable parameters.
+    """
+
+    def __init__(self, normalize: bool = False, eps: float = 1e-6):
+        super().__init__()
+        self.normalize = normalize
+        self.eps = eps
+
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
+        laplacian = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, 8.0, -1.0], [-1.0, -1.0, -1.0]]).view(1, 1, 3, 3)
+
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+        self.register_buffer("laplacian", laplacian)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Collapse multi-channel input (feature map or RGB/IR image) to single-channel intensity
+        if x.size(1) > 1:
+            x_gray = torch.mean(x, dim=1, keepdim=True)
+        else:
+            x_gray = x
+
+        kx = self.sobel_x.to(dtype=x_gray.dtype, device=x_gray.device)
+        ky = self.sobel_y.to(dtype=x_gray.dtype, device=x_gray.device)
+        klap = self.laplacian.to(dtype=x_gray.dtype, device=x_gray.device)
+
+        gx = F.conv2d(x_gray, kx, padding=1)
+        gy = F.conv2d(x_gray, ky, padding=1)
+        g_sobel = torch.sqrt(gx * gx + gy * gy + self.eps)
+        g_lap = torch.abs(F.conv2d(x_gray, klap, padding=1))
+
+        edge = 0.5 * g_sobel + 0.5 * g_lap
+        if self.normalize:
+            max_val = edge.amax(dim=(-2, -1), keepdim=True).clamp(min=self.eps)
+            edge = (edge / max_val).clamp(0.0, 1.0)
+        return edge
+
+
+class D_FATM(nn.Module):
+    """
+    Differential Feature Attention Transformation Module (D-FATM).
+    Replaces LCBHAM (FATM) at Layer 24 of the Neck to sharpen high-frequency
+    structural boundaries (e.g., van vs. car) with zero inference overhead
+    from Auxiliary Boundary Supervision (BAB).
+    """
+
+    def __init__(self, inc: int = 128) -> None:
+        super().__init__()
+        self.inc = inc
+
+        # Stage 1: CBH (3x3 Conv + BN + Hardswish) + LCAM (ChannelAttention)
+        self.conv2d = nn.Conv2d(inc, inc, kernel_size=3, stride=1, padding=1, bias=False)
+        self.batchnorm2d = nn.BatchNorm2d(inc)
+        self.hardswish = nn.Hardswish()
+        self.chatt = ChannelAttention(inc, 16)
+
+        # Stage 2: Differential High-Pass Edge Branch + Spatial Attention (LPAM upgrade)
+        self.high_pass = SobelLaplacianFilter(normalize=False)
+        self.edge_conv = nn.Conv2d(inc, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        self.spatial_conv = nn.Conv2d(3, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        self.edge_gain = nn.Parameter(torch.tensor(0.5))
+        self.sigmoid = nn.Sigmoid()
+
+        # Training-only cached predictions for AuxiliaryBoundaryLoss (BAB)
+        self.edge_logits = None
+        self.edge_pred = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Foreground feature transformation & channel attention (LCAM)
+        x_bn = self.batchnorm2d(self.conv2d(x))
+        x_forg = self.hardswish(x_bn)
+        x_cam = self.chatt(x_forg)
+
+        # 2. Differential high-frequency boundary extraction
+        diff_feat = torch.abs(x_cam - F.avg_pool2d(x_cam, kernel_size=3, stride=1, padding=1))
+        edge_prior = self.high_pass(x_cam)
+        edge_logits = self.edge_conv(diff_feat) + edge_prior
+        edge_att = self.sigmoid(edge_logits)  # (B, 1, H, W)
+
+        # Cache boundary prediction ONLY during training for AuxiliaryBoundaryLoss
+        if self.training:
+            self.edge_logits = edge_logits
+            self.edge_pred = edge_att
+        else:
+            self.edge_logits = None
+            self.edge_pred = None
+
+        # 3. Joint Spatial + Differential Boundary Attention
+        avg_out = torch.mean(x_cam, dim=1, keepdim=True)
+        max_out, _ = torch.max(x_cam, dim=1, keepdim=True)
+        spatial_cat = torch.cat([avg_out, max_out, edge_att], dim=1)  # (B, 3, H, W)
+        y = self.sigmoid(self.spatial_conv(spatial_cat))
+
+        gain = self.edge_gain.to(dtype=x_cam.dtype)
+        out = x_cam * y.expand_as(x_cam) + gain * (x_cam * edge_att.expand_as(x_cam))
+        return out

@@ -405,12 +405,14 @@ def train(hyp, opt, device, callbacks):
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                    imgs_rgb = imgs[:, :3, :, :]
+                    imgs_ir = imgs[:, 3:, :, :]
                     # irs = nn.functional.interpolate(irs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs_rgb, imgs_ir)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, targets.to(device), imgs=imgs_rgb, imgs_ir=imgs_ir)  # loss scaled by batch_size
                 # loss_items = torch.cat((lbox, lobj, lcls)).detach()
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode

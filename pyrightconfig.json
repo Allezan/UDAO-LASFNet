@@ -1,0 +1,25 @@
+{
+    "venvPath": ".",
+    "venv": ".venv",
+    "extraPaths": [
+        "."
+    ],
+    "typeCheckingMode": "off",
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportOptionalSubscript": "none",
+    "reportOptionalMemberAccess": "none",
+    "reportOptionalCall": "none",
+    "reportOptionalIterable": "none",
+    "reportOptionalContextManager": "none",
+    "reportOptionalOperand": "none",
+    "reportGeneralTypeIssues": "none",
+    "reportAttributeAccessIssue": "none",
+    "reportArgumentType": "none",
+    "reportAssignmentType": "none",
+    "reportOperatorIssue": "none",
+    "reportIndexIssue": "none",
+    "reportCallIssue": "none",
+    "reportReturnType": "none",
+    "reportPossiblyUnboundVariable": "none"
+}
