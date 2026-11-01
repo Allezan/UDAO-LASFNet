@@ -1136,8 +1136,8 @@ class DetectMultiBackend(nn.Module):
         """Performs a single inference warmup to initialize model weights, accepting an `imgsz` tuple for image size."""
         warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton
         if any(warmup_types) and (self.device.type != "cpu" or self.triton):
-            im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
-            ir = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)
+            im = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
+            ir = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)
             for _ in range(2 if self.jit else 1):  #
                 self.forward(im,ir)  # warmup
 
@@ -3718,6 +3718,8 @@ class CrossModalOffsetGenerator(nn.Module):
         scale = self.offset_scale.to(dtype=raw_offset.dtype)
         offset = scale * torch.tanh(raw_offset)  # bounded in [-gamma, +gamma]
         mask = torch.sigmoid(mask_logits)  # bounded in (0, 1), shape (B, 9, H, W)
+        offset = torch.nan_to_num(offset, nan=0.0, posinf=0.0, neginf=0.0)
+        mask = torch.nan_to_num(mask, nan=0.5, posinf=1.0, neginf=0.0)
         return offset, mask
 
 
@@ -3763,14 +3765,14 @@ class UDAO_ASFF(nn.Module):
         # 3. Cross-Modal Deformable Alignment of IR onto RGB reference frame
         offset, mask = self.offset_gen(ir_ca, rgb_feat)
         ir_aligned = deform_conv2d(
-            input=ir_ca,
-            offset=offset.to(dtype=ir_ca.dtype),
-            weight=self.ir_dcn_conv.weight.to(dtype=ir_ca.dtype),
-            bias=self.ir_dcn_conv.bias.to(dtype=ir_ca.dtype) if self.ir_dcn_conv.bias is not None else None,
+            input=ir_ca.contiguous(),
+            offset=offset.to(dtype=ir_ca.dtype).contiguous(),
+            weight=self.ir_dcn_conv.weight.to(dtype=ir_ca.dtype).contiguous(),
+            bias=self.ir_dcn_conv.bias.to(dtype=ir_ca.dtype).contiguous() if self.ir_dcn_conv.bias is not None else None,
             stride=(1, 1),
             padding=(1, 1),
             dilation=(1, 1),
-            mask=mask.to(dtype=ir_ca.dtype),
+            mask=mask.to(dtype=ir_ca.dtype).contiguous(),
         )
 
         # 4. Aligned Multimodal Addition + Position Attention (PAM)
@@ -3860,18 +3862,6 @@ class D_FATM(nn.Module):
         state["edge_logits"] = None
         state["edge_pred"] = None
         return state
-
-    def __deepcopy__(self, memo):
-        import copy
-
-        self.edge_logits = None
-        self.edge_pred = None
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
-        for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v, memo))
-        return result
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Foreground feature transformation & channel attention (LCAM)
