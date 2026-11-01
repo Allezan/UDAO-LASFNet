@@ -315,7 +315,8 @@ class DetectionModel(BaseModel):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             # forward = lambda x: self.forward(x,x2)[0] if isinstance(m, Segment) else self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s) , torch.zeros(1, ch, s, s))])  # forward
+            with torch.no_grad():
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s) , torch.zeros(1, ch, s, s))])  # forward
             # m.stride = torch.Tensor([8.0, 16.0, 32.0])
             # m.stride = torch.Tensor([8.0])
             check_anchor_order(m)

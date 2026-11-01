@@ -3855,6 +3855,24 @@ class D_FATM(nn.Module):
         self.edge_logits = None
         self.edge_pred = None
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["edge_logits"] = None
+        state["edge_pred"] = None
+        return state
+
+    def __deepcopy__(self, memo):
+        import copy
+
+        self.edge_logits = None
+        self.edge_pred = None
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Foreground feature transformation & channel attention (LCAM)
         x_bn = self.batchnorm2d(self.conv2d(x))
@@ -3867,8 +3885,8 @@ class D_FATM(nn.Module):
         edge_logits = self.edge_conv(diff_feat) + edge_prior
         edge_att = self.sigmoid(edge_logits)  # (B, 1, H, W)
 
-        # Cache boundary prediction ONLY during training for AuxiliaryBoundaryLoss
-        if self.training:
+        # Cache boundary prediction ONLY during active grad training for AuxiliaryBoundaryLoss
+        if self.training and torch.is_grad_enabled():
             self.edge_logits = edge_logits
             self.edge_pred = edge_att
         else:

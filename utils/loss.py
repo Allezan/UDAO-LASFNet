@@ -356,7 +356,13 @@ class ComputeLoss:
             for mod in self.dfatm_modules:
                 if mod.edge_logits is not None:
                     ledge += self.aux_boundary_loss(mod.edge_logits, targets, imgs, imgs_ir)
+                    mod.edge_logits = None
+                    mod.edge_pred = None
             ledge *= self.lambda_edge
+        else:
+            for mod in self.dfatm_modules:
+                mod.edge_logits = None
+                mod.edge_pred = None
         self.last_edge_loss = ledge.detach()
 
         bs = tobj.shape[0]  # batch size
