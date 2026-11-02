@@ -277,18 +277,11 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-        # Auxiliary Boundary Supervision (BAB) for D_FATM modules (if present in model)
-        self.dfatm_modules = [mod for mod in det_model.model.modules() if isinstance(mod, D_FATM)]
-        self.aux_boundary_loss = AuxiliaryBoundaryLoss().to(device) if self.dfatm_modules else None
-        self.lambda_edge = float(h.get("edge", 0.1))
-        self.last_edge_loss = torch.zeros(1, device=device)
-
     def __call__(self, p, targets, imgs=None, imgs_ir=None):  # predictions, targets, optional RGB/IR images
-        """Performs forward pass, calculating class, box, object, and optional auxiliary boundary loss."""
+        """Performs forward pass, calculating class, box, and object losses."""
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
-        ledge = torch.zeros(1, device=self.device)  # auxiliary boundary loss (BAB)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
@@ -351,23 +344,9 @@ class ComputeLoss:
         lobj *= self.hyp["obj"]
         lcls *= self.hyp["cls"]
 
-        # Auxiliary Boundary Loss (active only during training when D_FATM and input images are provided)
-        if self.aux_boundary_loss is not None and imgs is not None:
-            for mod in self.dfatm_modules:
-                if mod.edge_logits is not None:
-                    ledge += self.aux_boundary_loss(mod.edge_logits, targets, imgs, imgs_ir)
-                    mod.edge_logits = None
-                    mod.edge_pred = None
-            ledge *= self.lambda_edge
-        else:
-            for mod in self.dfatm_modules:
-                mod.edge_logits = None
-                mod.edge_pred = None
-        self.last_edge_loss = ledge.detach()
-
         bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls + ledge) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
         #return (lbox + lobj + lcls) * bs, lbox , lobj , lcls
 
         # return (lbox + lobj) * bs, torch.cat((lbox, lobj, lcls)).detach()

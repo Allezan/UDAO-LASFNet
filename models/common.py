@@ -3683,6 +3683,11 @@ class CrossModalOffsetGenerator(nn.Module):
     Lightweight Cross-Modal Deformable Offset & Modulation Mask Generator.
     Predicts 2D spatial offsets (2 * K * K) and modulation scalars (K * K)
     by jointly analyzing channel-attended IR and RGB features.
+
+    Adheres to Zhu et al. (CVPR 2019) DCNv2 Identity Mapping:
+    - Offset channels are initialized to 0.0 (sampling grid stays at identity).
+    - Mask channels are initialized with positive bias (+3.0) so sigmoid(mask) starts at ~0.95-1.0,
+      ensuring the incoming IR modality is fully preserved without attenuation.
     """
 
     def __init__(self, channels: int = 128, kernel_size: int = 3, init_scale: float = 2.0):
@@ -3703,9 +3708,15 @@ class CrossModalOffsetGenerator(nn.Module):
         # Learnable offset range scaler gamma (initialized to 2.0 -> +/-16px at stride 8)
         self.offset_scale = nn.Parameter(torch.tensor(float(init_scale)))
 
-        # Zero-initialize projection so initial training starts from identity grid (zero offset)
+        # DCNv2 Identity Mapping Initialization (Zhu et al., CVPR 2019):
+        # 1. Zero-init weights so initial offset and mask logits are independent of input
         nn.init.constant_(self.pw_conv.weight, 0.0)
-        nn.init.constant_(self.pw_conv.bias, 0.0)
+        # 2. Offset bias: 0.0 (zero displacement)
+        num_offset = 2 * kernel_size * kernel_size
+        with torch.no_grad():
+            self.pw_conv.bias[:num_offset].zero_()
+            # 3. Mask bias: +3.0 (sigmoid(3.0) = 0.9526, full sensor throughput at epoch 0)
+            self.pw_conv.bias[num_offset:].fill_(3.0)
 
     def forward(self, x_ir: torch.Tensor, x_rgb: torch.Tensor):
         x_cross = torch.cat([x_ir, x_rgb], dim=1)  # (B, 2C, H, W)
@@ -3717,9 +3728,9 @@ class CrossModalOffsetGenerator(nn.Module):
 
         scale = self.offset_scale.to(dtype=raw_offset.dtype)
         offset = scale * torch.tanh(raw_offset)  # bounded in [-gamma, +gamma]
-        mask = torch.sigmoid(mask_logits)  # bounded in (0, 1), shape (B, 9, H, W)
+        mask = torch.sigmoid(mask_logits)  # strictly in (0, 1), shape (B, 9, H, W)
         offset = torch.nan_to_num(offset, nan=0.0, posinf=0.0, neginf=0.0)
-        mask = torch.nan_to_num(mask, nan=0.5, posinf=1.0, neginf=0.0)
+        mask = torch.nan_to_num(mask, nan=1.0, posinf=1.0, neginf=0.0)
         return offset, mask
 
 
@@ -3792,7 +3803,7 @@ class SobelLaplacianFilter(nn.Module):
     with zero trainable parameters.
     """
 
-    def __init__(self, normalize: bool = False, eps: float = 1e-6):
+    def __init__(self, normalize: bool = True, eps: float = 1e-6):
         super().__init__()
         self.normalize = normalize
         self.eps = eps
@@ -3832,8 +3843,8 @@ class D_FATM(nn.Module):
     """
     Differential Feature Attention Transformation Module (D-FATM).
     Replaces LCBHAM (FATM) at Layer 24 of the Neck to sharpen high-frequency
-    structural boundaries (e.g., van vs. car) with zero inference overhead
-    from Auxiliary Boundary Supervision (BAB).
+    structural boundaries (e.g., vehicle silhouettes) via implicit boundary
+    attention, maintaining strict scale invariance and zero extra loss.
     """
 
     def __init__(self, inc: int = 128) -> None:
@@ -3846,22 +3857,11 @@ class D_FATM(nn.Module):
         self.hardswish = nn.Hardswish()
         self.chatt = ChannelAttention(inc, 16)
 
-        # Stage 2: Differential High-Pass Edge Branch + Spatial Attention (LPAM upgrade)
-        self.high_pass = SobelLaplacianFilter(normalize=False)
-        self.edge_conv = nn.Conv2d(inc, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        # Stage 2: Implicit Boundary-Guided Spatial Attention (CBAM/FATM Upgrade)
+        # Combines Average Pooling, Max Pooling, and Sobel-Laplacian Edge Prior into unified gating
+        self.high_pass = SobelLaplacianFilter(normalize=True)
         self.spatial_conv = nn.Conv2d(3, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        self.edge_gain = nn.Parameter(torch.tensor(0.5))
         self.sigmoid = nn.Sigmoid()
-
-        # Training-only cached predictions for AuxiliaryBoundaryLoss (BAB)
-        self.edge_logits = None
-        self.edge_pred = None
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["edge_logits"] = None
-        state["edge_pred"] = None
-        return state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Foreground feature transformation & channel attention (LCAM)
@@ -3869,26 +3869,15 @@ class D_FATM(nn.Module):
         x_forg = self.hardswish(x_bn)
         x_cam = self.chatt(x_forg)
 
-        # 2. Differential high-frequency boundary extraction
-        diff_feat = torch.abs(x_cam - F.avg_pool2d(x_cam, kernel_size=3, stride=1, padding=1))
-        edge_prior = self.high_pass(x_cam)
-        edge_logits = self.edge_conv(diff_feat) + edge_prior
-        edge_att = self.sigmoid(edge_logits)  # (B, 1, H, W)
-
-        # Cache boundary prediction ONLY during active grad training for AuxiliaryBoundaryLoss
-        if self.training and torch.is_grad_enabled():
-            self.edge_logits = edge_logits
-            self.edge_pred = edge_att
-        else:
-            self.edge_logits = None
-            self.edge_pred = None
-
-        # 3. Joint Spatial + Differential Boundary Attention
+        # 2. Extract spatial statistics: Average, Max, and Normalized Boundary Contours
         avg_out = torch.mean(x_cam, dim=1, keepdim=True)
         max_out, _ = torch.max(x_cam, dim=1, keepdim=True)
-        spatial_cat = torch.cat([avg_out, max_out, edge_att], dim=1)  # (B, 3, H, W)
-        y = self.sigmoid(self.spatial_conv(spatial_cat))
+        edge_out = self.high_pass(x_cam)  # (B, 1, H, W), normalized in [0, 1]
 
-        gain = self.edge_gain.to(dtype=x_cam.dtype)
-        out = x_cam * y.expand_as(x_cam) + gain * (x_cam * edge_att.expand_as(x_cam))
+        # 3. Implicit Spatial + Boundary Gating (strictly bounded in [0, 1])
+        spatial_cat = torch.cat([avg_out, max_out, edge_out], dim=1)  # (B, 3, H, W)
+        spatial_att = self.sigmoid(self.spatial_conv(spatial_cat))     # (B, 1, H, W)
+
+        # 4. Attention modulation maintaining exact feature scale invariance
+        out = x_cam * spatial_att.expand_as(x_cam)
         return out
