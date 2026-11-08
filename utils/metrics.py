@@ -9,6 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+# Compatibility patch for NumPy 2.0+ (np.trapz was removed in favor of np.trapezoid)
+if not hasattr(np, 'trapz') and hasattr(np, 'trapezoid'):
+    np.trapz = np.trapezoid
+
 from utils import TryExcept, threaded
 
 
@@ -115,7 +119,8 @@ def compute_ap(recall, precision):
     method = "interp"  # methods: 'continuous', 'interp'
     if method == "interp":
         x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)  # integrate
+        integrate_fn = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
+        ap = integrate_fn(np.interp(x, mrec, mpre), x)  # integrate
     else:  # 'continuous'
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve
@@ -227,7 +232,7 @@ class ConfusionMatrix:
             print(" ".join(map(str, self.matrix[i])))
 
 
-def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, ShapeIoU=True, scale=0.5, eps=1e-7):
     """
     Calculates IoU, GIoU, DIoU, or CIoU between two boxes, supporting xywh/xyxy formats.
 
@@ -256,6 +261,19 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
 
     # IoU
     iou = inter / union
+    if ShapeIoU:
+        # Shape-IoU: More Accurate Metric considering Bounding Box Shape and Scale (Zhang et al., 2023)
+        cw = (b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)).clamp(eps)
+        ch = (b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)).clamp(eps)
+        ww = 2 * (w2 ** scale) / (w2 ** scale + h2 ** scale + eps)
+        hh = 2 * (h2 ** scale) / (w2 ** scale + h2 ** scale + eps)
+        dx = (b2_x1 + b2_x2 - b1_x1 - b1_x2) / 2
+        dy = (b2_y1 + b2_y2 - b1_y1 - b1_y2) / 2
+        D_shape = hh * (dx / cw) ** 2 + ww * (dy / ch) ** 2
+        omega_w = hh * torch.abs(w1 - w2) / torch.maximum(w1, w2)
+        omega_h = ww * torch.abs(h1 - h2) / torch.maximum(h1, h2)
+        Omega_shape = (1 - torch.exp(-omega_w)).pow(4) + (1 - torch.exp(-omega_h)).pow(4)
+        return iou - (D_shape + 0.5 * Omega_shape)
     if CIoU or DIoU or GIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
