@@ -30,9 +30,17 @@ wandb/
 comet_ml/
 events.out.tfevents.*
 
-# IDE & OS Files
+# IDE, Agent Customizations & OS Files
 .vscode/
 .idea/
+.agents/
+.agent/
 .DS_Store
 Thumbs.db
+
+# Thesis Documents & Reference Papers (Local Only)
+doc/
+*.docx
+*.pdf
+
 
