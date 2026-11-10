@@ -301,9 +301,8 @@ class ComputeLoss:
                 iou = bbox_iou(pbox, tbox[i], CIoU=False, ShapeIoU=True).squeeze()  # Shape-IoU (prediction, target)
                 lbox += (1.0 - iou).mean()  # Shape-IoU regression loss
 
-                # Objectness confidence target decoupled from Shape-IoU aspect penalty
-                ciou = bbox_iou(pbox.detach(), tbox[i], CIoU=True, ShapeIoU=False).squeeze()
-                iou = ciou.detach().clamp(0).type(tobj.dtype)
+                # Objectness
+                iou = iou.detach().clamp(0).type(tobj.dtype)
 
                 
                 

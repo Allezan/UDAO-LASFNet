@@ -1806,7 +1806,8 @@ class LoadMultiModalImagesAndLabels(Dataset):  # for training/testing
 
         self.labels = self.labels_rgb
         self.shapes = self.shapes_rgb
-        self.indices = self.indices_rgb
+        self.indices = list(self.indices_rgb)
+        self.n = n_rgb
 
     def cache_labels(self, imgfiles, labelfiles, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -1875,7 +1876,7 @@ class LoadMultiModalImagesAndLabels(Dataset):  # for training/testing
     #     return self
 
     def __getitem__(self, index):
-        # index = self.indices[index]  # linear, shuffled, or image_weights
+        index = self.indices[index]  # linear, shuffled, or image_weights
         index_rgb = self.indices_rgb[index]  # linear, shuffled, or image_weights
         index_ir = self.indices_ir[index]  # linear, shuffled, or image_weights
 
