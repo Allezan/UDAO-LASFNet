@@ -204,8 +204,8 @@ def run(
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
-        val_path_rgb = data['val_rgb']
-        val_path_ir = data['val_ir']
+        val_path_rgb = data.get(f"{task}_rgb", data["val_rgb"])
+        val_path_ir = data.get(f"{task}_ir", data["val_ir"])
         dataloader = create_dataloader_rgb_ir(
             # data[task],
             val_path_rgb, val_path_ir,

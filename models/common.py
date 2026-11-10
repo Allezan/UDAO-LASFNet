@@ -3680,14 +3680,17 @@ from torchvision.ops import deform_conv2d
 
 class CrossModalOffsetGenerator(nn.Module):
     """
-    Lightweight Cross-Modal Deformable Offset & Modulation Mask Generator.
-    Predicts 2D spatial offsets (2 * K * K) and modulation scalars (K * K)
-    by jointly analyzing channel-attended IR and RGB features.
+    Lightweight Cross-Modal Deformable Offset & Modulation Mask Generator (v2).
+    First performs pointwise (1x1) cross-modal channel mixing so RGB and IR features
+    interact at the pixel level, followed by 3x3 spatial correlation and a 3x3
+    offset/mask head (Chan et al., CVPR 2021 BasicVSR++; Zhu et al., CVPR 2019 DCNv2).
 
-    Adheres to Zhu et al. (CVPR 2019) DCNv2 Identity Mapping:
-    - Offset channels are initialized to 0.0 (sampling grid stays at identity).
-    - Mask channels are initialized with positive bias (+3.0) so sigmoid(mask) starts at ~0.95-1.0,
-      ensuring the incoming IR modality is fully preserved without attenuation.
+    Initialization guarantees near-identity mapping at epoch 0 while avoiding dead
+    backpropagation gradients into preceding layers:
+    - Offset/mask head weights initialized with N(0, 0.001^2).
+    - Offset bias initialized to 0.0 (zero initial displacement).
+    - Mask bias initialized to 0.0 with mask = 2.0 * sigmoid(logits) -> starts at 1.0
+      at the maximum gradient slope of sigmoid.
     """
 
     def __init__(self, channels: int = 128, kernel_size: int = 3, init_scale: float = 2.0):
@@ -3695,32 +3698,35 @@ class CrossModalOffsetGenerator(nn.Module):
         self.channels = channels
         self.kernel_size = kernel_size
         in_ch = channels * 2
+        mid_ch = max(32, channels // 2)
         out_ch = 3 * kernel_size * kernel_size  # 18 offset channels + 9 mask channels for K=3
 
-        # Depthwise-separable cross-modal offset predictor
+        # 1. Cross-modal channel mixing (1x1) so RGB & IR interact before spatial filtering
+        self.cross_mix = nn.Conv2d(in_ch, mid_ch, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_mix = nn.BatchNorm2d(mid_ch)
+
+        # 2. Spatial neighborhood correlation (3x3 depthwise conv)
         self.dw_conv = nn.Conv2d(
-            in_ch, in_ch, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=in_ch, bias=False
+            mid_ch, mid_ch, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=mid_ch, bias=False
         )
-        self.bn = nn.BatchNorm2d(in_ch)
+        self.bn = nn.BatchNorm2d(mid_ch)
         self.act = nn.SiLU(inplace=True)
-        self.pw_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+
+        # 3. 3x3 spatial offset & modulation predictor
+        self.pw_conv = nn.Conv2d(mid_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True)
 
         # Learnable offset range scaler gamma (initialized to 2.0 -> +/-16px at stride 8)
         self.offset_scale = nn.Parameter(torch.tensor(float(init_scale)))
 
-        # DCNv2 Identity Mapping Initialization (Zhu et al., CVPR 2019):
-        # 1. Zero-init weights so initial offset and mask logits are independent of input
-        nn.init.constant_(self.pw_conv.weight, 0.0)
-        # 2. Offset bias: 0.0 (zero displacement)
-        num_offset = 2 * kernel_size * kernel_size
+        # Non-zero micro-initialization to prevent dead gradients while keeping epoch-0 identity
+        nn.init.normal_(self.pw_conv.weight, mean=0.0, std=0.001)
         with torch.no_grad():
-            self.pw_conv.bias[:num_offset].zero_()
-            # 3. Mask bias: +3.0 (sigmoid(3.0) = 0.9526, full sensor throughput at epoch 0)
-            self.pw_conv.bias[num_offset:].fill_(3.0)
+            self.pw_conv.bias.zero_()
 
     def forward(self, x_ir: torch.Tensor, x_rgb: torch.Tensor):
         x_cross = torch.cat([x_ir, x_rgb], dim=1)  # (B, 2C, H, W)
-        feat = self.act(self.bn(self.dw_conv(x_cross)))
+        x_mix = self.act(self.bn_mix(self.cross_mix(x_cross)))
+        feat = self.act(self.bn(self.dw_conv(x_mix))) + x_mix
         out = self.pw_conv(feat)  # (B, 27, H, W)
 
         o1, o2, mask_logits = torch.chunk(out, 3, dim=1)
@@ -3728,16 +3734,18 @@ class CrossModalOffsetGenerator(nn.Module):
 
         scale = self.offset_scale.to(dtype=raw_offset.dtype)
         offset = scale * torch.tanh(raw_offset)  # bounded in [-gamma, +gamma]
-        mask = torch.sigmoid(mask_logits)  # strictly in (0, 1), shape (B, 9, H, W)
+        mask = 2.0 * torch.sigmoid(mask_logits)  # in (0, 2), equals 1.0 at init (bias=0)
         offset = torch.nan_to_num(offset, nan=0.0, posinf=0.0, neginf=0.0)
-        mask = torch.nan_to_num(mask, nan=1.0, posinf=1.0, neginf=0.0)
+        mask = torch.nan_to_num(mask, nan=1.0, posinf=2.0, neginf=0.0)
         return offset, mask
 
 
 class UDAO_ASFF(nn.Module):
     """
     Uncertainty-Driven Deformable Alignment & Attention-Guided Self-Modulation
-    Feature Fusion (UDAO-ASFF). Replaces static MFS at Layer 10 (P3/8).
+    Feature Fusion (UDAO-ASFF v2). Replaces static MFS at Layer 10 (P3/8).
+    Incorporates a static IR anchor branch alongside the deformable aligned IR branch
+    to preserve large-object interior semantics while correcting cross-modal parallax.
     """
 
     def __init__(self, channels: int = 128, index: int = 4):
@@ -3748,10 +3756,12 @@ class UDAO_ASFF(nn.Module):
         # Stage 1a: Channel Attention (ECA 1D Conv)
         self.channel_att = channel_att(channels)
 
-        # Stage 1b: RGB spatial branch (3x3 DWConv) & Cross-Modal Deformable IR branch
+        # Stage 1b: RGB spatial branch, Static IR anchor branch, & Deformable IR branch
         self.rgb_dwconv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=channels)
+        self.ir_dwconv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=channels)
         self.offset_gen = CrossModalOffsetGenerator(channels, kernel_size=3, init_scale=2.0)
         self.ir_dcn_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, groups=channels)
+        self.deform_gamma = nn.Parameter(torch.tensor(0.5))
 
         # Stage 1c: Position Attention Module (1D H/W Coordinate Attention)
         self.local_att = local_att(channels)
@@ -3770,12 +3780,13 @@ class UDAO_ASFF(nn.Module):
         rgb_ca = self.channel_att(input_rgb) + input_rgb
         ir_ca = self.channel_att(input_ir) + input_ir
 
-        # 2. RGB reference spatial refinement
+        # 2. RGB reference spatial refinement & Static IR anchor refinement
         rgb_feat = self.rgb_dwconv(rgb_ca)
+        ir_static = self.ir_dwconv(ir_ca)
 
         # 3. Cross-Modal Deformable Alignment of IR onto RGB reference frame
         offset, mask = self.offset_gen(ir_ca, rgb_feat)
-        ir_aligned = deform_conv2d(
+        ir_deform = deform_conv2d(
             input=ir_ca.contiguous(),
             offset=offset.to(dtype=ir_ca.dtype).contiguous(),
             weight=self.ir_dcn_conv.weight.to(dtype=ir_ca.dtype).contiguous(),
@@ -3785,10 +3796,11 @@ class UDAO_ASFF(nn.Module):
             dilation=(1, 1),
             mask=mask.to(dtype=ir_ca.dtype).contiguous(),
         )
+        ir_aligned = ir_static + self.deform_gamma.to(dtype=ir_deform.dtype) * ir_deform
 
-        # 4. Aligned Multimodal Addition + Position Attention (PAM)
+        # 4. Aligned Multimodal Addition + Residual Position Attention (PAM)
         xc = rgb_feat + ir_aligned
-        x_loc = self.local_att(xc)
+        x_loc = self.local_att(xc) + xc
 
         # 5. Self-Modulation Feature Block (FMB) + Channel Shuffle
         x_mod = self.fmb(x_loc)
@@ -3817,11 +3829,11 @@ class SobelLaplacianFilter(nn.Module):
         self.register_buffer("laplacian", laplacian)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Collapse multi-channel input (feature map or RGB/IR image) to single-channel intensity
+        # Collapse multi-channel input using mean absolute energy so +/- activations do not cancel
         if x.size(1) > 1:
-            x_gray = torch.mean(x, dim=1, keepdim=True)
+            x_gray = torch.mean(torch.abs(x), dim=1, keepdim=True)
         else:
-            x_gray = x
+            x_gray = torch.abs(x)
 
         kx = self.sobel_x.to(dtype=x_gray.dtype, device=x_gray.device)
         ky = self.sobel_y.to(dtype=x_gray.dtype, device=x_gray.device)
@@ -3841,43 +3853,47 @@ class SobelLaplacianFilter(nn.Module):
 
 class D_FATM(nn.Module):
     """
-    Differential Feature Attention Transformation Module (D-FATM).
-    Replaces LCBHAM (FATM) at Layer 24 of the Neck to sharpen high-frequency
-    structural boundaries (e.g., vehicle silhouettes) via implicit boundary
-    attention, maintaining strict scale invariance and zero extra loss.
+    Differential Feature Attention Transformation Module (D-FATM v2).
+    Uses Residual Boundary-Guided Attention (Wang et al., CVPR 2017; Woo et al., ECCV 2018)
+    across multi-scale detection heads (P3/8, P4/16, P5/32) so high-frequency vehicle
+    boundaries are sharpened while interior features of medium/large vehicles (truck,
+    van, freight car) are preserved without multiplicative attenuation.
     """
 
     def __init__(self, inc: int = 128) -> None:
         super().__init__()
         self.inc = inc
+        groups = max(1, inc // 16)
+        reduction = 16 if inc <= 256 else 32
 
-        # Stage 1: CBH (3x3 Conv + BN + Hardswish) + LCAM (ChannelAttention)
-        self.conv2d = nn.Conv2d(inc, inc, kernel_size=3, stride=1, padding=1, bias=False)
+        # Stage 1: Residual CBH (3x3 Conv + BN + Hardswish) + LCAM (ChannelAttention)
+        self.conv2d = nn.Conv2d(inc, inc, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)
         self.batchnorm2d = nn.BatchNorm2d(inc)
         self.hardswish = nn.Hardswish()
-        self.chatt = ChannelAttention(inc, 16)
+        self.chatt = ChannelAttention(inc, reduction)
 
-        # Stage 2: Implicit Boundary-Guided Spatial Attention (CBAM/FATM Upgrade)
-        # Combines Average Pooling, Max Pooling, and Sobel-Laplacian Edge Prior into unified gating
-        self.high_pass = SobelLaplacianFilter(normalize=True)
+        # Stage 2: Implicit Boundary-Guided Spatial Attention
+        self.high_pass = SobelLaplacianFilter(normalize=False)
+        self.edge_bn = nn.BatchNorm2d(1)
         self.spatial_conv = nn.Conv2d(3, 1, kernel_size=3, stride=1, padding=1, bias=False)
         self.sigmoid = nn.Sigmoid()
+        self.gamma = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Foreground feature transformation & channel attention (LCAM)
+        # 1. Foreground feature transformation with residual identity & channel attention
         x_bn = self.batchnorm2d(self.conv2d(x))
-        x_forg = self.hardswish(x_bn)
+        x_forg = self.hardswish(x_bn) + x
         x_cam = self.chatt(x_forg)
 
-        # 2. Extract spatial statistics: Average, Max, and Normalized Boundary Contours
+        # 2. Extract spatial statistics: Average, Max, and BatchNorm-calibrated Boundary Contours
         avg_out = torch.mean(x_cam, dim=1, keepdim=True)
         max_out, _ = torch.max(x_cam, dim=1, keepdim=True)
-        edge_out = self.high_pass(x_cam)  # (B, 1, H, W), normalized in [0, 1]
+        edge_out = self.edge_bn(self.high_pass(x_cam))
 
-        # 3. Implicit Spatial + Boundary Gating (strictly bounded in [0, 1])
+        # 3. Residual Spatial + Boundary Gating (prevents 50% interior attenuation on large objects)
         spatial_cat = torch.cat([avg_out, max_out, edge_out], dim=1)  # (B, 3, H, W)
         spatial_att = self.sigmoid(self.spatial_conv(spatial_cat))     # (B, 1, H, W)
 
-        # 4. Attention modulation maintaining exact feature scale invariance
-        out = x_cam * spatial_att.expand_as(x_cam)
+        # 4. Residual attention modulation: F_out = F_forg + gamma * (F_cam * A_spatial)
+        out = x_forg + self.gamma.to(dtype=x_cam.dtype) * (x_cam * spatial_att.expand_as(x_cam))
         return out

@@ -299,11 +299,11 @@ class ComputeLoss:
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[i], CIoU=False, ShapeIoU=True).squeeze()  # Shape-IoU (prediction, target)
+                lbox += (1.0 - iou).mean()  # Shape-IoU regression loss
 
-                
-                lbox += (1.0 - iou).mean()  # iou loss
-                # Objectness
-                iou = iou.detach().clamp(0).type(tobj.dtype)
+                # Objectness confidence target decoupled from Shape-IoU aspect penalty
+                ciou = bbox_iou(pbox.detach(), tbox[i], CIoU=True, ShapeIoU=False).squeeze()
+                iou = ciou.detach().clamp(0).type(tobj.dtype)
 
                 
                 

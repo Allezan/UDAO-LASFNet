@@ -1742,6 +1742,16 @@ class LoadMultiModalImagesAndLabels(Dataset):  # for training/testing
         self.n_ir = n_ir
         self.indices_ir = range(n_ir)
 
+        # Multimodal Ground-Truth Completion:
+        # In low-light/nighttime scenes (e.g., DroneVehicle), unimodal RGB labels may be empty or
+        # miss dark vehicles that are annotated in the IR label set (labelr). Adopt the more complete set.
+        if len(self.labels_rgb) == len(self.labels_ir):
+            for idx in range(len(self.labels_rgb)):
+                if len(self.labels_ir[idx]) > len(self.labels_rgb[idx]):
+                    self.labels_rgb[idx] = self.labels_ir[idx].copy()
+                elif len(self.labels_rgb[idx]) > len(self.labels_ir[idx]):
+                    self.labels_ir[idx] = self.labels_rgb[idx].copy()
+
         # Rectangular Training
         if self.rect:
             # RGB

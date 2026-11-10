@@ -332,10 +332,10 @@ class DetectionModel(BaseModel):
     def forward(self, x, x2, augment=False, profile=False, visualize=False):
         """Performs single-scale or augmented inference and may include profiling or visualization."""
         if augment:
-            return self._forward_augment(x)  # augmented inference, None
+            return self._forward_augment(x, x2)  # augmented inference, None
         return self._forward_once(x, x2, profile, visualize)  # single-scale inference, train
 
-    def _forward_augment(self, x):
+    def _forward_augment(self, x, x2):
         """Performs augmented inference across different scales and flips, returning combined detections."""
         img_size = x.shape[-2:]  # height, width
         s = [1, 0.83, 0.67]  # scales
@@ -343,7 +343,8 @@ class DetectionModel(BaseModel):
         y = []  # outputs
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = self._forward_once(xi)[0]  # forward
+            xi2 = scale_img(x2.flip(fi) if fi else x2, si, gs=int(self.stride.max()))
+            yi = self._forward_once(xi, xi2)[0]  # forward
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
